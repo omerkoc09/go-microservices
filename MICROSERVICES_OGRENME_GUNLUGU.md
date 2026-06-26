@@ -9,7 +9,7 @@
 
 **Proje:** `go-micro` — Go ile yazılmış bir mikroservis sistemi
 **Başlangıç:** Sıfır mikroservis bilgisiyle başladım
-**Son güncelleme:** 2026-06-25
+**Son güncelleme:** 2026-06-26 (Docker Swarm ile deploy eklendi)
 
 ---
 
@@ -18,12 +18,14 @@
 1. [Mikroservis Nedir? (Büyük Resim)](#1-mikroservis-nedir-büyük-resim)
 2. [Sistem Mimarisi — Şu Anki Hali](#2-sistem-mimarisi--şu-anki-hali)
 3. [Servisler Tek Tek](#3-servisler-tek-tek)
-4. [Kullandığımız Teknolojiler](#4-kullandığımız-teknolojiler)
-5. [Öğrenme Zaman Çizelgesi (Git Geçmişinden)](#5-öğrenme-zaman-çizelgesi-git-geçmişinden)
-6. [Kavram Sözlüğü (Sorduğum Sorular + Cevapları)](#6-kavram-sözlüğü-sorduğum-sorular--cevapları)
-7. [Takıldığım Hatalar ve Çözümleri](#7-takıldığım-hatalar-ve-çözümleri)
-8. [Tekrar Eden Pattern'ler (Her Serviste Aynı)](#8-tekrar-eden-patternler-her-serviste-aynı)
-9. [Sırada Ne Var?](#9-sırada-ne-var)
+4. [gRPC ile Servis İletişimi (Detay)](#35-grpc-ile-servis-iletişimi-detay)
+5. [Docker Swarm ile Deployment (Detay)](#36-docker-swarm-ile-deployment-detay)
+6. [Kullandığımız Teknolojiler](#4-kullandığımız-teknolojiler)
+7. [Öğrenme Zaman Çizelgesi (Git Geçmişinden)](#5-öğrenme-zaman-çizelgesi-git-geçmişinden)
+8. [Kavram Sözlüğü (Sorduğum Sorular + Cevapları)](#6-kavram-sözlüğü-sorduğum-sorular--cevapları)
+9. [Takıldığım Hatalar ve Çözümleri](#7-takıldığım-hatalar-ve-çözümleri)
+10. [Tekrar Eden Pattern'ler (Her Serviste Aynı)](#8-tekrar-eden-patternler-her-serviste-aynı)
+11. [Sırada Ne Var?](#9-sırada-ne-var)
 
 ---
 
@@ -106,6 +108,10 @@ Monolith:                      Mikroservis:
 - **Senkron:** Broker → Auth servisine direkt HTTP isteği atar, cevap bekler.
 - **Asenkron:** Broker → RabbitMQ kuyruğuna mesaj bırakır, unutur. Listener kuyruktan alır.
 
+Logger servisine log yazmanın artık **dört yolu** var (hepsi aynı MongoDB kaydına çıkar):
+HTTP (`/log`, :80), RabbitMQ (listener üzerinden), RPC (:5001), **gRPC (:50001)**. Bu kasıtlı —
+kurs aynı işi farklı protokollerle göstererek hangisinin ne zaman uygun olduğunu öğretiyor.
+
 ---
 
 ## 3. Servisler Tek Tek
@@ -150,6 +156,7 @@ Monolith:                      Mikroservis:
 - **Endpoint:** `POST /log` → `WriteLog`: gelen JSON'ı (name + data) MongoDB'ye yazar.
 - **RPC:** `rpc.go` içinde `RPCServer.LogInfo(payload, *resp)` — broker RPC üzerinden log yazabilir.
 - **`rpcListen()`:** `go app.rpcListen()` ile goroutine'de başlar, TCP 5001'i dinler. HTTP sunucusu (`ListenAndServe`) main'i bloklar, RPC arka planda çalışır.
+- **gRPC:** `grpc.go` içinde `LogServer.WriteLog(...)` — broker gRPC üzerinden de log yazabilir. `go app.gRPCListen()` ile TCP 50001'de dinler. → **Logger artık aynı anda 3 protokol dinliyor: HTTP (80) + RPC (5001) + gRPC (50001).** Üçü de sonunda aynı `LogEntry.Insert()` ile MongoDB'ye yazıyor; sadece "kapıdan giriş şekli" farklı.
 
 ### ✉️ Mail Service
 - **Görev:** Email gönderir (SMTP).
@@ -174,6 +181,512 @@ Monolith:                      Mikroservis:
 
 ---
 
+## 3.5. gRPC ile Servis İletişimi (Detay)
+
+> Commit: `add communication between services using gRPC` (2026-06-25). Logger servisine
+> **4. çağrı yöntemi** olarak gRPC eklendi (HTTP, RPC'den sonra). Broker → Logger arasında
+> binary, hızlı, dil-bağımsız bir iletişim kuruldu.
+
+### gRPC nedir? (net/rpc'den farkı)
+
+Günlükte zaten `net/rpc` (Go'nun yerleşik RPC'si) vardı. **gRPC**, onun "büyümüş,
+endüstri standardı" hali — Google'ın geliştirdiği, dil-bağımsız, yüksek performanslı bir
+RPC framework'ü.
+
+```
+HTTP/JSON:   POST /log  { "name": "...", "data": "..." }   ← metin, yavaş, dışarıya açık
+net/rpc:     LogInfo(payload)                              ← Go-only, binary, TCP
+gRPC:        c.WriteLog(ctx, &LogRequest{...})             ← dil-bağımsız, binary, HTTP/2
+```
+
+| | HTTP/JSON | net/rpc | gRPC |
+|---|-----------|---------|------|
+| Veri formatı | JSON (metin) | Go gob (binary) | Protobuf (binary) |
+| Taşıma | HTTP/1.1 | TCP | **HTTP/2** (multiplexing, streaming) |
+| Dil bağımsız | ✅ | ❌ (sadece Go) | ✅ (her dil) |
+| Hız | Yavaş | Hızlı | En hızlı |
+| Sözleşme | Yok (elle) | Yok (Go struct) | `.proto` dosyası |
+| Port (logger) | 80 | 5001 | 50001 |
+
+### `.proto` — sözleşme (contract)
+
+Her şeyin kaynağı `logs.proto` dosyası. Servisin ne kabul edip ne döndüğünü **bir kez**
+burada tanımlarsın, sonra `protoc` her dil için kod üretir:
+
+```proto
+message Log         { string name = 1; string data = 2; }
+message LogRequest  { Log LogEntry = 1; }
+message LogResponse { string result = 1; }
+
+service LogService {
+    rpc WriteLog(LogRequest) returns (LogResponse);   // ← uzaktan çağrılacak fonksiyon
+}
+```
+
+`= 1`, `= 2` → **field number'lar** (alan sırası değil, binary'de hangi alan olduğunu
+işaretleyen etiket). Bir kez verdiysen değiştirme — eski veriyi bozar.
+
+### `protoc` ile kod üretimi
+
+```bash
+protoc --go_out=. --go_opt=paths=source_relative \
+       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+       logs.proto
+```
+
+İki dosya üretir:
+- **`logs.pb.go`** → mesaj tipleri (`Log`, `LogRequest`, `LogResponse` struct'ları + getter'lar).
+- **`logs_grpc.pb.go`** → gRPC client/server iskeleti: `LogServiceClient`, `LogServiceServer`,
+  `RegisterLogServiceServer`, `NewLogServiceClient`, `UnimplementedLogServiceServer`.
+
+> Bu dosyalara **elle dokunulmaz** — `.proto` değişince yeniden üretilir. `protoc` tek başına
+> Go üretmez; `protoc-gen-go` ve `protoc-gen-go-grpc` plugin'leri gerekir (`go install` ile kurulur,
+> `$GOPATH/bin` PATH'te olmalı).
+
+### Server tarafı — Logger (`grpc.go`)
+
+Logger gRPC'de **server** (çağrıyı karşılayan):
+
+```go
+type LogServer struct {
+    logs.UnimplementedLogServiceServer   // ← üretilen base, zorunlu (ileri uyumluluk için)
+    Models data.Models
+}
+
+func (l *LogServer) WriteLog(ctx context.Context, req *logs.LogRequest) (*logs.LogResponse, error) {
+    input := req.GetLogEntry()
+    logEntry := data.LogEntry{Name: input.Name, Data: input.Data}
+    err := l.Models.LogEntry.Insert(logEntry)   // ← RPC ve HTTP ile AYNI iş: MongoDB'ye yaz
+    ...
+    return &logs.LogResponse{Result: "logged!"}, nil
+}
+
+func (app *Config) gRPCListen() {
+    lis, _ := net.Listen("tcp", fmt.Sprintf(":%s", gRpcPort))   // 50001
+    s := grpc.NewServer()
+    logs.RegisterLogServiceServer(s, &LogServer{Models: app.Models})
+    s.Serve(lis)   // bloklayıcı → o yüzden main'de "go app.gRPCListen()" goroutine ile
+}
+```
+
+`main.go`: `go app.gRPCListen()` → RPC (`go app.rpcListen()`) gibi goroutine'de başlar,
+HTTP sunucusu main'i bloklar. **3 dinleyici aynı anda canlı.**
+
+### Client tarafı — Broker (`handlers.go` → `LogViaGRPC`)
+
+Broker gRPC'de **client** (çağrıyı yapan):
+
+```go
+func (app *Config) LogViaGRPC(w http.ResponseWriter, r *http.Request) {
+    // 1. Bağlan (insecure = TLS yok, iç ağda güvenli)
+    conn, _ := grpc.Dial("logger-service:50001",
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+        grpc.WithBlock())
+    defer conn.Close()
+
+    // 2. Client oluştur (üretilen koddan)
+    c := logs.NewLogServiceClient(conn)
+
+    // 3. Timeout'lu context
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+    defer cancel()
+
+    // 4. Uzaktaki fonksiyonu LOCAL'deymiş gibi çağır ← RPC'nin özü budur
+    _, err = c.WriteLog(ctx, &logs.LogRequest{
+        LogEntry: &logs.Log{Name: ..., Data: ...},
+    })
+}
+```
+
+`routes.go`: `mux.Post("/log-grpc", app.LogViaGRPC)` → front-end test sayfası bu endpoint'i tetikler.
+
+### Akış (uçtan uca)
+
+```
+Front-end (test sayfası)
+    │  POST /log-grpc  (HTTP/JSON)
+    ▼
+Broker  ── LogViaGRPC ──→  grpc.Dial("logger-service:50001")
+    │                          c.WriteLog(ctx, LogRequest{...})   ← gRPC (HTTP/2, binary)
+    ▼
+Logger  ── WriteLog ──→  Models.LogEntry.Insert()
+    │
+    ▼
+MongoDB  (log kaydedildi)
+```
+
+> **Aynı `logs.proto` hem broker'da hem logger'da var** — RabbitMQ'daki `event.go` gibi.
+> İki taraf da **birebir aynı sözleşmeyi** kullanmalı, yoksa binary uyuşmaz. Üretilen
+> `logs.pb.go`/`logs_grpc.pb.go` her iki serviste de mevcut.
+
+---
+
+## 3.6. Docker Swarm ile Deployment (Detay)
+
+> 2026-06-26. Şimdiye kadar her şeyi `docker-compose` ile **tek makinede** çalıştırıyorduk.
+> Artık servisleri gerçek bir şekilde **deploy** etme aşamasına geçtik: image'ları Docker
+> Hub'a push'ladık ve `docker stack deploy` ile Swarm kümesine dağıttık. Dosya: `project/swarm.yml`.
+
+> 🧭 **ÖNEMLİ ÇERÇEVE — buradan sonrası "mikroservis" değil, "deployment/DevOps":**
+> Bu bölümdeki her şey (Docker Hub, Swarm, node/manager/worker, reverse proxy, SSL, **server
+> kiralama**) artık **bu projeye özel değil** — Docker'a koyabildiğin **herhangi bir uygulamayı**
+> (mikroservis, monolith, tek dosyalık script, WordPress...) yayına almak için **aynıdır**.
+> Yani bu kısımda öğrendiğin bilgi **transfer edilebilir**: yarın bambaşka bir proje yapsan
+> bu adımları aynen kullanırsın. Mikroservis mimarisi (servis bölme, broker, gRPC, RabbitMQ...)
+> büyük ölçüde bitti; şu an öğrendiğimiz **deployment**.
+>
+> ```
+> 1. Uygulamanı yaz            → dile/mimariye özel (mikroservis mi monolith mi)
+> 2. Docker image yap          → genel
+> 3. Docker Hub'a push          → genel
+> 4. Sunucu kirala (Linode...)  → genel   ← Linode adımı buraya düşer
+> 5. Sunucuda Docker+Swarm kur  → genel
+> 6. stack deploy               → genel
+> 7. reverse proxy + domain + SSL → genel
+> ```
+> Adım 1 hariç hepsi uygulamadan bağımsız. Swarm = "kendi sunucunu yönet" tarafındaki **en
+> basit orkestrasyon**; alternatifleri: Kubernetes (büyük ölçek), PaaS (Render/Railway/Fly.io
+> — "sunucuyla uğraşma"), managed containers (Fargate/Cloud Run). Kavramlar (replica,
+> self-healing, proxy) bir kez öğrenilince hepsine transfer olur.
+
+### Docker Hub nedir?
+
+Docker image'larının saklandığı **bulut tabanlı kayıt deposu (registry)**. GitHub'ın kod için
+olduğu şey, Docker Hub'ın image'lar için olduğu şeydir.
+
+- `docker build` ile lokal makinende bir image üretirsin.
+- `docker push omerkoc0/broker-service:1.0.0` → o image lokalden çıkıp **Docker Hub sunucularına** yüklenir.
+- İsimlendirme: `omerkoc0` = Docker Hub kullanıcı adı, `broker-service` = image adı, `1.0.0` = **tag** (versiyon).
+
+> **"Image'lar nereye taşındı?"** → Lokal makinenden Docker Hub'a (internetteki merkezi depoya).
+
+### Neden image'ları Docker Hub'a push'luyoruz?
+
+Çünkü Swarm birden fazla makineye (node) dağıtım yapabilir. Bir image'ı çalıştıracak **her
+makinenin** o image'a erişebilmesi gerekir. Lokal makinendeki image'ı diğer makineler göremez
+— ama herkes Docker Hub'a erişebilir.
+
+```
+Senin makinen                Docker Hub                 Swarm node'ları
+─────────────                ──────────                 ───────────────
+docker build      ──push──►  omerkoc0/broker  ──pull──► node1, node2, node3...
+                             omerkoc0/listener           (image'ı buradan çeker)
+                             omerkoc0/auth...
+```
+
+`swarm.yml` içindeki `image: omerkoc0/broker-service:1.0.0` satırı tam bunu der: "Bu servisi
+çalıştırırken Docker Hub'daki bu image'ı çek ve kullan."
+
+> **Dikkat:** `rabbitmq`, `mongo`, `postgres`, `mailhog` bizim image'larımız değil — bunlar
+> zaten Docker Hub'da herkese açık **resmi (official)** image'lar, onları push'lamaya gerek yok.
+
+### Docker Swarm nedir, ne işe yarar?
+
+Docker'ın yerleşik **container orchestration (orkestrasyon)** aracı. Orkestrasyon = birden fazla
+makineyi tek mantıksal küme gibi yönetip container'ları bu makinelere otomatik dağıtmak.
+
+`docker-compose` **tek makinede** çalışır. Swarm bunun üstüne şunları ekler:
+
+| Özellik | Açıklama |
+|---------|----------|
+| **Multi-node** | Birkaç sunucuyu birleştirip tek havuz gibi kullanırsın; Swarm dağıtımı kendi yapar |
+| **Replica yönetimi** | `replicas: 3` dersen 3 kopya ayağa kalkar, yük aralarında dağılır (ölçekleme) |
+| **Self-healing** | Bir container çökerse Swarm fark eder ve istenen replica sayısını korumak için otomatik yenisini başlatır |
+| **Load balancing** | Aynı servisin çok replica'sı varsa gelen istekleri Swarm otomatik paylaştırır |
+
+### `replicated` vs `global` mode
+
+`swarm.yml`'de iki tür deploy modu var:
+
+```yaml
+deploy:
+  mode: replicated     # broker, auth, logger, mailer, postgres...
+  replicas: 1          # toplam kaç kopya çalışacak
+```
+- **`replicated` + `replicas: N`** → kümede toplam N kopya çalışır.
+- **`global`** → kümedeki **her node'da birer tane** çalışır (`rabbitmq`, `mailhog`, `mongo` böyle).
+
+### Node, Manager, Worker
+
+Swarm'ın temel üç kavramı:
+
+```
+        ┌─────────────── SWARM KÜMESİ ───────────────┐
+        │   [Manager Node]   ◄──── komuta merkezi     │
+        │        │                                     │
+        │        ├──────────┬──────────┐              │
+        │        ▼          ▼          ▼              │
+        │   [Worker 1]  [Worker 2]  [Worker 3]        │
+        │   container'lar burada çalışır               │
+        └─────────────────────────────────────────────┘
+```
+
+- **Node** = Swarm kümesine katılmış bir makine (sunucu, VM ya da senin laptop'un). Manager ya da worker olur.
+- **Manager** = kümenin **beyni**. Küme durumunu tutar, orkestrasyon kararlarını verir (kim nerede çalışacak, çökeni kim başlatacak), **yönetim komutlarını yalnızca o kabul eder** (`docker service`, `docker stack deploy`). İstersen container da çalıştırır.
+- **Worker** = işi yapan kas. Sadece manager'ın atadığı container'ları (task) çalıştırır, karar vermez, yönetim komutu çalıştıramaz.
+
+> **Tek sayı manager (3, 5...):** Production'da manager'lar arasında **Raft** consensus
+> (oylama) çalışır; kararların geçerli olması için çoğunluğun (quorum) hayatta olması gerekir.
+> O yüzden tek sayı seçilir (1 çökse diğer 2 devam eder). Lokal/öğrenme için **tek manager yeter**.
+
+> **Bizim durumumuz (tek makine):** Laptop'ta `docker swarm init` deyince tek node olur ve o
+> node hem manager hem worker rolünü üstlenir. Ayrı worker makineler kurmaya gerek yok — tüm
+> `replicas` ve `global` servisler bu tek node üzerinde çalışır.
+
+### Deploy akışı (komutlar)
+
+```bash
+docker swarm init                              # 1. Bu makineyi manager yap, kümeyi başlat
+docker stack deploy -c swarm.yml swarm         # 2. swarm.yml'i kümeye dağıt ("swarm" = stack adı)
+docker stack services swarm                     # servisleri ve replica durumunu gör
+docker stack rm swarm                           # stack'i kaldır
+```
+
+Başka bir makineyi worker olarak katmak için manager'ın verdiği token kullanılır:
+```bash
+docker swarm join --token <token> <manager-ip>:2377
+```
+
+### Deploy edilmiş servisi güncelleme (rolling update, sıfır kesinti)
+
+> **Önemli ayrım:** "scale etmek" (kopya sayısını artırmak) ile "update etmek" (yeni versiyona
+> geçmek) **ayrı işlemlerdir**. Scale, update'in parçası değil — update'in **kesintisiz** olmasını
+> sağlayan ön koşuldur.
+
+**1. Yeni versiyonu build + yeni tag + push:**
+```bash
+docker build -t omerkoc0/broker-service:1.0.1 .
+docker push omerkoc0/broker-service:1.0.1
+```
+**Yeni tag şart** (`1.0.0` → `1.0.1`): Swarm "image değişti mi?" kararını tag'e bakarak verir.
+Aynı tag'i ezmek güvenilir değil — Swarm aynı tag'i çoğu zaman yeniden çekmez.
+
+**2. Downtime'ı önleyen asıl şey → birden fazla replica:**
+Tek replica (`replicas: 1`) varsa, update sırasında o tek container durup yenisi açılana kadar
+kısa bir **downtime** olur (servisi karşılayan başka kopya yok). O yüzden önce **scale** edilir:
+```bash
+docker service scale swarm_broker-service=3
+```
+```
+replicas: 1 →  [v1] durdur ─► boşluk (DOWNTIME!) ─► [v2] başlat
+
+replicas: 3 →  [v1][v1][v1]   Swarm teker teker günceller, diğerleri ayakta:
+               [v2][v1][v1]   ← kullanıcı hep cevap alır
+               [v2][v2][v1]
+               [v2][v2][v2]   ← bitti, KESİNTİ YOK
+```
+
+**3. Rolling update'i tetikle:**
+```bash
+docker service update --image omerkoc0/broker-service:1.0.1 swarm_broker-service
+```
+Swarm replica'ları **birer birer** yeni image'la değiştirir. Davranış `swarm.yml`'den ayarlanır:
+```yaml
+deploy:
+  replicas: 3
+  update_config:
+    parallelism: 1          # aynı anda kaç replica güncellensin (1 = teker teker)
+    delay: 10s              # her biri arasında bekle
+    order: start-first      # önce yeniyi başlat (sağlıklı olunca) sonra eskiyi durdur → boşluk olmaz
+    failure_action: rollback # yeni versiyon patlarsa otomatik eski haline dön (güvenlik ağı)
+```
+
+**Doğru sıralama özeti:**
+```
+1. build + yeni tag (1.0.1) + push       ← yeni versiyon Docker Hub'da
+2. replicas > 1 olsun (gerekirse scale)  ← downtime'ı önlemek için
+3. docker service update --image ...1.0.1 ← rolling update, teker teker değişir
+4. başarısızsa otomatik rollback          ← güvenlik ağı
+```
+
+> **Kafa karışıklığı düzeltmesi:** "Önce scale → sonra değiştir" sezgisi doğru ama scale,
+> update için *zorunlu* değil — sadece update'i **kesintisiz** yapar. Zaten `replicas` 1'den
+> fazlaysa ayrıca scale etmene gerek yok, doğrudan `service update` yeterli.
+
+### Reverse Proxy — servislerin önündeki tek kapı (sıradaki adım)
+
+> Front-end'i Swarm'a ekledikten sonra hocanın işaret ettiği problem: Swarm'ı ayağa
+> kaldırmak kolay ama front-end'e **düzgün erişmenin bir yolu yok**. Çözüm: en öne bir
+> **reverse proxy (proxy web server)** koymak.
+
+**Problem:** Şu an her servise ayrı port mapping'le erişiyoruz (broker `:8080`, mailhog `:8025`...).
+Gerçek dünyada kullanıcı `http://site.com:8080/handle` yazmaz — sadece `http://site.com` yazar.
+Dağınık portları **tek temiz adrese** indirip "hangi servise gidecek?" kararını birinin vermesi gerekir.
+
+**Çözüm:** Tüm servislerin önüne bir **kapıcı** koyarsın. Bütün istekler önce ona gelir, o da
+isteğe (genelde URL yoluna) bakıp doğru servise **yönlendirir (route)**.
+
+```
+                          ┌─────────────────────┐
+   Kullanıcı (tarayıcı)   │   REVERSE PROXY     │
+        │  http://localhost│  (Caddy/Nginx/      │
+        └────────────────►│   Traefik)  :80     │
+                          └──────────┬──────────┘
+                          ┌──────────┴──────────┐
+                          ▼                     ▼
+                  ┌───────────────┐    ┌───────────────┐
+                  │  Front-End    │    │    Broker     │
+                  └───────────────┘    └───────────────┘
+```
+- `http://localhost/`        → **front-end** (arayüzü göster)
+- `http://localhost/handle`  → **broker** (API isteği)
+
+> **Neden sadece bu iki servis?** Dışarıdan trafik alan yalnızca **front-end** ve **broker** var.
+> Geri kalanlar (auth, logger, mailer, listener, mongo, postgres) zaten iç ağda, dışarı kapalı —
+> proxy onlara yönlendirme yapmaz.
+
+**Reverse proxy ≠ broker (iki ayrı katman!):**
+
+| | Reverse Proxy | Broker (API Gateway) |
+|---|---|---|
+| Nerede | Tüm Swarm'ın **en önünde** | Mikroservislerin önünde |
+| Neye bakar | URL yoluna (`/` mı `/handle` mı) | İstek body'sindeki `action` alanına |
+| Yönlendirir | front-end **veya** broker'a | auth / logger / mailer'a |
+| Katman | Altyapı / network | Uygulama mantığı |
+
+Yani akış uzuyor:
+```
+Tarayıcı → Reverse Proxy → Broker → (auth / logger / mailer)
+                        ↘ Front-End
+```
+
+> Sonraki adım: `swarm.yml`'e proxy'yi (muhtemelen **Caddy**) yeni bir servis olarak eklemek
+> + bir config dosyası (`Caddyfile` gibi) yazmak.
+
+#### Caddy'yi `swarm.yml`'e ekleme (yapıldı)
+
+Reverse proxy olarak **Caddy** seçtik ve `swarm.yml`'e ekledik:
+
+```yaml
+caddy:
+  image: omerkoc0/micro-caddy:1.0.0   # kendi image'ımız (Caddyfile içine gömülü)
+  deploy:
+    mode: replicated
+    replicas: 1
+  ports:
+    - "80:80"                         # HTTP  → dışarı bakan tek kapı
+    - "443:443"                       # HTTPS → otomatik TLS için
+  volumes:
+    - caddy_data:/data                # SSL sertifikaları burada KALICI saklanır
+    - caddy_config:/config
+
+volumes:
+  caddy_data:
+    external: true                    # "bu volume'u ben önceden oluşturdum, sen yaratma"
+  caddy_config:
+```
+
+**Kritik noktalar:**
+- **`micro-caddy` = kendi image'ımız.** Resmi `caddy` image'ını doğrudan kullanmıyoruz çünkü
+  **Caddyfile'ı içine gömmemiz** gerekiyor: Dockerfile resmi caddy'yi alır + `Caddyfile`'ı
+  kopyalar → `micro-caddy` adıyla build + Docker Hub'a push.
+- **Artık dışarı bakan tek kapı Caddy** (`:80`/`:443`). Dikkat: **broker'dan `ports` kaldırıldı**
+  (eskiden `"8080:80"` vardı) — artık broker'a Caddy üzerinden erişiliyor. İstediğimiz tek temiz kapı.
+- **`:443` = otomatik HTTPS.** Caddy'nin süper gücü: gerçek domain'de Let's Encrypt'ten SSL
+  sertifikasını **otomatik alır ve yeniler**, elle uğraşmazsın (Nginx'te bu manuel).
+- **`caddy_data` volume'u kritik:** Aldığı SSL sertifikaları burada saklanır. Olmasaydı her
+  restart'ta sertifikayı sıfırdan alır → Let's Encrypt rate limit'ine takılırdın. Volume = kalıcılık.
+- **`external: true`:** "Bu volume zaten var (`docker volume create caddy_data` ile elle oluşturdum),
+  Swarm yenisini yaratma." → Deploy'dan önce `docker volume create caddy_data` çalıştırmak gerekir.
+
+Akış artık:
+```
+Tarayıcı ──:80/:443──► Caddy ──┬──► front-end   (/ isteği)
+                               └──► broker       (/handle isteği)
+                                       │
+                                       ▼
+                              auth / logger / mailer
+```
+
+> ⚠️ **Takıldığım YAML hatası:** `front-end` servisinde `mode: replicated:` (sondaki fazladan
+> `:`) yazmışım, `replicas` da yanlış girintiye kaymıştı. Doğrusu diğer servislerle aynı:
+> `mode: replicated` + altına aynı hizada `replicas: 1`.
+
+#### Caddyfile'ın içi — virtual host'lar + neden `:80`
+
+`Caddyfile` Caddy'ye "hangi adrese gelen isteği nereye yönlendireceğini" söyler. Bizim dosyamız
+(`project/Caddyfile`):
+
+```caddy
+{
+    email   you@gmail.com           # Let's Encrypt sertifikası için iletişim maili
+}
+
+(static) {                          # tekrar kullanılabilir blok (snippet): statik dosya cache'i
+	@static { file; path *.ico *.css *.js *.png *.svg *.woff *.json ... }
+	header @static Cache-Control max-age=5184000
+}
+
+(security) { ... }                  # güvenlik header'ları (HSTS, nosniff, referrer-policy)
+
+localhost:80 {                      # 1. VIRTUAL HOST → front-end
+	encode zstd gzip                # yanıtları sıkıştır (hızlı transfer)
+	import static                   # yukarıdaki (static) snippet'ini buraya kat
+	reverse_proxy http://front-end:8081
+}
+
+backend:80 {                        # 2. VIRTUAL HOST → broker
+	reverse_proxy http://broker-service:8080
+}
+```
+
+**Virtual host (sanal sunucu) nedir?** Caddyfile'da her `isim:port { ... }` bloğu bir virtual
+host. Caddy gelen isteğin **host adına** bakıp doğru bloğa yönlendirir:
+- İstek `localhost`'a → **front-end:8081**
+- İstek `backend`'e → **broker-service:8080**
+
+> Bu, reverse proxy'nin "hangi servise?" kararı — ama URL path'ine değil, **host adına** göre.
+> İçerideki `front-end:8081` / `broker-service:8080` Docker iç DNS isimleri (servis adıyla erişim).
+
+**⚠️ Neden `localhost:80` — `:80` neden ŞART (hocanın uyarısı):**
+Caddy varsayılan olarak her site bloğu için **otomatik HTTPS** dener → Let's Encrypt'ten SSL
+sertifikası almaya çalışır. Ama `localhost`/`backend` **gerçek domain değil**, Let's Encrypt
+bunlara sertifika **veremez** (internetten doğrulayamaz) → **patlar**.
+```
+localhost    { ... }   → Caddy ":443 HTTPS + Let's Encrypt" dener → HATA
+localhost:80 { ... }   → ":80" = "düz HTTP yeter, sertifika deneme" → çalışır ✓
+```
+Yani `:80` yazarak Caddy'ye "burada HTTPS deneme" demiş oluyoruz. Gerçek domain (`site.com`)
+olunca `:80`'i kaldırırsın, Caddy otomatik HTTPS'i devreye sokar.
+
+#### `backend` ismini tanıtma (`/etc/hosts`)
+
+`localhost` her makinede otomatik tanımlı ama `backend` **uydurma bir isim** — makine "backend
+nedir?" diye bilmez. Tarayıcıdan `http://backend` çalışsın diye bu ismi makineye tanıttık.
+`/etc/hosts` (makinenin mini telefon rehberi: "isim → IP") dosyasına ekledik:
+
+```
+127.0.0.1   localhost backend       # backend artık 127.0.0.1'i (kendi makineyi) işaret eder
+::1         localhost backend       # aynısı IPv6 için
+```
+`127.0.0.1` = "bu makinenin kendisi". Düzenleme `sudo vim /etc/hosts` ile yapılır, `:wq` ile kaydedilir.
+
+Tam zincir:
+```
+Tarayıcı "http://backend"
+   │  /etc/hosts: backend = 127.0.0.1   ← bu satırı ekledik
+   ▼
+Caddy :80  (backend:80 bloğu yakalar)
+   ▼
+broker-service:8080
+```
+
+> **Not:** `/etc/hosts` ayarı **sadece bu makine** için geçerli — lokal test çözümü. Gerçek
+> sunucuda `backend` yerine gerçek domain (`api.site.com`) olur, isim çözümü DNS ile yapılır.
+
+#### SSL/TLS sertifikası nedir? (Caddy'nin otomatik HTTPS'inin temeli)
+
+- **HTTP** = şifresiz hat, yolda (wifi/ISP/router) okunabilir. **HTTPS (SSL/TLS)** = şifreli hat → kilit ikonu, `https://`. (Doğru terim **TLS**, "SSL" eski adı; ikisi de aynı şey kastedilir.)
+- **SSL sertifikası** = sitenin dijital kimliği, iki iş yapar: (1) **kimlik doğrulama** ("ben gerçekten o siteyim, sahte değil"), (2) **şifreleme** (içindeki public key ile veri şifrelenir, sadece sunucudaki private key çözer).
+- **CA (Certificate Authority)** = sertifikayı imzalayan güvenilir kuruluş (pasaportu veren devlet gibi). Tarayıcılar güvenilir CA listesini önceden bilir. Bizim CA: **Let's Encrypt** (ücretsiz, otomatik).
+- **Caddy'nin süper gücü:** Gerçek domain'de Let's Encrypt'ten sertifikayı otomatik **alır, kurar, 90 günde bir yeniler** — elle uğraşmazsın (Nginx'te bu manuel).
+
+> **`caddy_data` volume'u burada anlam kazanır:** Caddy aldığı sertifikaları `/data`'ya yazar.
+> Volume olmasaydı her container restart'ında sertifika kaybolur, Caddy yeniden ister ve
+> Let's Encrypt **rate limit**'ine takılırdın. Volume = sertifika kalıcılığı.
+
+---
+
 ## 4. Kullandığımız Teknolojiler
 
 ### 🐳 Docker & Docker Compose
@@ -186,6 +699,14 @@ Monolith:                      Mikroservis:
 - **Volume'lar:** `./db-data/...:/var/lib/...` → container silinse bile veri kalıcı kalır.
 - **`depends_on`:** Servis başlama sırasını zorlar (önce postgres, sonra auth).
 - **Önemli:** Logger gibi iç servislerde `ports` yok → sadece Docker iç ağındaki servisler erişebilir, dışarıdan erişilemez (güvenlik).
+
+### 🐝 Docker Hub & Docker Swarm
+- **Docker Hub:** Image'ları sakladığın merkezi bulut deposu (registry). `docker push` ile yükle, makineler `docker pull` ile çeker. Detay: bkz. [Bölüm 3.6](#36-docker-swarm-ile-deployment-detay).
+- **Docker Swarm:** Birden çok makineyi (node) tek küme yapıp container'ları yöneten orkestrasyon aracı. `docker-compose`'un çok-makineli, üretime yakın hali.
+- **Node / Manager / Worker:** Node = kümedeki makine. Manager = karar veren beyin (komutları o kabul eder). Worker = sadece atanan container'ları çalıştıran işçi.
+- **replica & self-healing:** Bir servisin kaç kopya çalışacağını sen söylersin (`replicas`), çöken kopyayı Swarm otomatik yeniden başlatır.
+- **`replicated` vs `global`:** replicated = toplam N kopya; global = her node'da birer tane.
+- **compose vs swarm farkı:** Aynı YAML formatı ama Swarm'da `deploy:` bloğu (mode, replicas) devreye girer; `docker stack deploy` ile dağıtılır. Bu projede: `project/swarm.yml`.
 
 ### 🐘 PostgreSQL (İlişkisel / SQL)
 - Veriler önceden tanımlı **tablolarda**, her satır aynı yapıda.
@@ -221,6 +742,13 @@ Monolith:                      Mikroservis:
 - **Sadece mikroservis değil:** Monolith'te de kullanılır (sipariş→fatura+kargo+email paralel işleme).
 - **Neden Kafka değil:** RabbitMQ basit, olgun, kurulumu kolay, öğrenmek için ideal. Kafka milyonlarca mesaj/saniye gereken devasa sistemler için.
 
+### 🔌 gRPC + Protocol Buffers
+- **gRPC:** Google'ın RPC framework'ü. Servis-servis iletişiminde çok yaygın. HTTP/2 + binary → hızlı.
+- **Protocol Buffers (protobuf):** Verinin binary serileştirme formatı + sözleşme dili (`.proto`). JSON'un dil-bağımsız, hızlı, tip-güvenli alternatifi.
+- **`protoc`:** `.proto` → kaynak kod derleyicisi. macOS'ta `brew install protobuf` ile kurulur (standart `.proto` import'larıyla birlikte gelir). Tek başına Go üretmez.
+- **Plugin'ler:** `protoc-gen-go` (mesajlar) + `protoc-gen-go-grpc` (servis). `go install ...@latest` ile kurulur, `$GOPATH/bin` PATH'te olmalı.
+- Bu projede: **Broker (client) → Logger (server)** arası `LogService.WriteLog`. Detay: bkz. [Bölüm 3.5](#35-grpc-ile-servis-iletişimi-detay).
+
 ### 🛠️ Makefile
 - Uzun komutlara kısa isimler verir. `make up_build` gibi.
 - Komutlar: `up` (build'siz başlat), `up_build` (derle + build + başlat), `down` (durdur), `build_broker`/`build_auth`/`build_logger` (Linux binary derle), `start`/`stop` (front-end).
@@ -249,6 +777,8 @@ Monolith:                      Mikroservis:
 | 13 | `add the logger service` | 4. servis: Logger + **MongoDB**. `bson.D`/`bson.M`, cursor, `ObjectIDFromHex`, `context`. `serve()` + goroutine. |
 | 14 | `add mail service` | 5. servis: Mail + **SMTP**. HTML/plain template, **inline CSS** (premailer). |
 | 15 | `add listener service and RabbitMQ` | 6. servis: Listener + **RabbitMQ/AMQP**. Emitter (broker), Consumer (listener), exchange, channel, routing key. |
+| 16 | `add communication between services using gRPC` | **gRPC + Protocol Buffers**. `.proto` sözleşmesi, `protoc` ile kod üretimi (`logs.pb.go` + `logs_grpc.pb.go`). Logger = server (`grpc.go`, port 50001), Broker = client (`LogViaGRPC`). Logger artık 3 protokol dinliyor. |
+| 17 | Docker Swarm ile deploy (`project/swarm.yml`) | **Docker Hub** (image registry) + **Docker Swarm** (orkestrasyon). Image'ları `docker push` ile Hub'a yükledim. Node/manager/worker, `replicated` vs `global` mode, replica, self-healing kavramları. `docker swarm init` + `docker stack deploy` akışı. |
 
 ---
 
@@ -496,6 +1026,174 @@ Teknik olarak mümkün ama pratikte çok nadir — iki bağlantı havuzu, iki mi
 transaction karmaşıklığı. Mikroservislerde **doğal** çünkü her servis kendi DB'sine sahip,
 biri diğerini etkilemez (Polyglot Persistence).
 
+### "gRPC nedir, net/rpc'den farkı ne? Madem RPC var, niye bir de gRPC?"
+İkisi de "uzaktaki fonksiyonu local'deymiş gibi çağırma" fikri. Farklar:
+- **net/rpc** sadece Go ↔ Go çalışır (Go'nun gob formatı). gRPC **dil-bağımsız** — Go servisi
+  Python/Java servisini çağırabilir, çünkü ortak dil `.proto`.
+- **net/rpc** TCP üzerinde, gRPC **HTTP/2** üzerinde (multiplexing, streaming).
+- gRPC **sözleşme önce (contract-first)** çalışır: `.proto`'da tanımlarsın, kod üretilir → iki taraf
+  da kesin aynı tipi kullanır, tip-güvenlik garanti. net/rpc'de elle struct uydurursun.
+Kısaca gRPC, RPC fikrinin endüstri-standardı, dil-bağımsız, daha hızlı hali.
+
+### "protoc ne işe yarar? protoc-gen-go neden ayrı?"
+`protoc` = protobuf derleyicisi. `.proto` dosyasını okur ama **tek başına Go üretmez** —
+hangi dile çevireceğini plugin'ler söyler. `protoc-gen-go` mesaj tiplerini, `protoc-gen-go-grpc`
+servis/client iskeletini üretir. protoc bu plugin'leri PATH'te `protoc-gen-*` ismiyle arar,
+o yüzden `$GOPATH/bin` PATH'te olmalı. (macOS'ta `protoc`'u elle kopyalamak yerine
+`brew install protobuf` — yanında standart `.proto` import'larını da getirir.)
+
+### "logs.pb.go ve logs_grpc.pb.go dosyalarını elle düzenler miyim?"
+**Hayır.** Bunlar `protoc` çıktısı (generated code). `.proto` değişince yeniden üretilir,
+elle yaptığın değişiklik silinir. Sadece `.proto`'yu düzenle, sonra `protoc`'u tekrar çalıştır.
+İçindeki `Unimplemented...Server` da senin değil, ileri-uyumluluk için üretilen base struct.
+
+### "Aynı .proto neden hem broker'da hem logger'da var?"
+RabbitMQ'daki `event.go` ile aynı mantık: gRPC'nin iki ucu (client + server) **birebir aynı
+sözleşmeyi** kullanmak zorunda, yoksa binary uyuşmaz. Logger server'ı implemente eder,
+broker client'ı kullanır — ama ikisi de aynı `logs.proto`'dan üretilmiş koda ihtiyaç duyar.
+İdeal çözüm ortak bir paket/repo olurdu; kursta basitlik için kopyalandı.
+
+### "grpc.Dial'daki insecure ve WithBlock ne?"
+- `insecure.NewCredentials()` → **TLS yok**. Üretimde gRPC TLS ister ama bu servisler Docker
+  iç ağında konuşuyor (dışarı kapalı), o yüzden şifrelemesiz. Üretimde mTLS eklenir.
+- `grpc.WithBlock()` → bağlantı kurulana kadar `Dial` **bekler** (yoksa bağlantı arka planda
+  kurulur, ilk çağrı "not ready" diye patlayabilir).
+
+### "gRPC neden tarayıcıdan (web browser) doğrudan kullanılamıyor?" (kurs uyarısı)
+Kurs şunu vurguluyor: **gRPC backend'de (servis-servis) harika, ama tarayıcıdan doğrudan
+çalışmaz.** Sebep teknik: gRPC, **HTTP/2'nin düşük seviye kontrolüne** (trailer'lar, binary
+framing) ihtiyaç duyar; tarayıcıların `fetch`/`XMLHttpRequest` API'leri bu kadar derine
+erişim vermez. Bu yüzden tarayıcıdaki JavaScript doğrudan gRPC isteği atamaz.
+
+Bu yüzden bizim mimaride iletişim ikiye bölünmüş — ve doğru yapılmış:
+```
+Front-end (tarayıcı) ──HTTP/JSON──→ Broker ──gRPC──→ Logger
+   (gRPC YOK, çünkü                 (gRPC client)    (gRPC server)
+    tarayıcı yapamaz)
+```
+- **Tarayıcı → Broker:** HTTP/JSON (`POST /log-grpc`). gRPC **değil**.
+- **Broker → Logger:** gRPC. İki taraf da sunucu (Docker iç ağı) → çalışır ve hızlıdır.
+
+> ⚠️ **İsim tuzağı:** `/log-grpc` endpoint'inin **kendisi HTTP**. "grpc" eki, broker'ın o
+> isteği aldıktan *sonra* logger'a gRPC ile ileteceğini anlatır. Broker burada bir
+> **çevirmen** gibi: dışarıdan HTTP alır, içeride gRPC konuşur.
+>
+> (Tarayıcıdan gRPC için **gRPC-Web** + proxy diye bir çözüm var ama kurs şimdilik oraya
+> girmiyor. "Eventually that'll probably change" derken bunu kastediyor.)
+
+### "Docker Hub nedir? Image'lar nereye taşındı?"
+Docker Hub = image'ların saklandığı **bulut tabanlı kayıt deposu (registry)**. GitHub'ın kod
+için olduğu şey. `docker push omerkoc0/broker-service:1.0.0` deyince image lokal makinenden
+çıkıp **Docker Hub sunucularına** yüklenir. Yani image'lar lokalden internetteki merkezi depoya
+taşındı. İsim formatı: `kullanıcı/image-adı:tag` → `omerkoc0/broker-service:1.0.0`. Detay: bkz.
+[Bölüm 3.6](#36-docker-swarm-ile-deployment-detay).
+
+### "Image'ları neden Docker Hub'a push'luyoruz?"
+Çünkü Swarm container'ları birden çok makineye dağıtabilir ve o makinelerin hepsinin image'a
+erişmesi gerekir. Lokal image'ı diğer makineler göremez; ama herkes Docker Hub'a erişip
+`pull` edebilir. `push` = lokal image'ı Hub'a yükle, `pull` = Hub'dan makineye indir (Swarm bunu
+otomatik yapar). `rabbitmq`, `mongo`, `postgres` gibi resmi image'lar zaten Hub'da, onları
+push'lamaya gerek yok.
+
+### "Docker Swarm nedir, docker-compose'dan farkı ne?"
+Swarm = Docker'ın yerleşik **orkestrasyon** aracı: birden çok makineyi (node) tek küme yapıp
+container'ları otomatik dağıtır. `docker-compose` **tek makinede** çalışır; Swarm bunun üstüne
+multi-node, replica yönetimi, self-healing (çökeni otomatik başlatma) ve load balancing ekler.
+Aynı YAML formatı ama Swarm'da `deploy:` bloğu (mode, replicas) anlam kazanır ve `docker stack
+deploy` ile dağıtılır.
+
+### "Node, manager, worker nedir?"
+- **Node** = Swarm kümesine katılmış bir makine (sunucu/VM/laptop). Manager ya da worker olur.
+- **Manager** = kümenin beyni. Durumu tutar, "kim nerede çalışacak / çökeni kim başlatacak" kararını verir, **yönetim komutlarını yalnızca o kabul eder** (`docker stack deploy` vb.). İstersen container da çalıştırır.
+- **Worker** = sadece manager'ın atadığı container'ları çalıştıran işçi; karar vermez.
+- Production'da **tek sayı manager** (3/5) seçilir çünkü Raft consensus'ta çoğunluk (quorum) gerekir. Lokalde tek node hem manager hem worker olur, yeterli.
+
+### "`replicated` ve `global` mode farkı ne?"
+- **`replicated` + `replicas: N`** → kümede **toplam N kopya** çalışır (örn. `replicas: 1`).
+- **`global`** → kümedeki **her node'da birer tane** çalışır (bizim `rabbitmq`, `mongo`, `mailhog`).
+Bir servisi ölçeklemek için `replicas` sayısını artırırsın; Swarm yeni kopyaları başlatır ve yükü dağıtır.
+
+### "Self-healing nedir?"
+Swarm'ın, senin müdahalen olmadan **bozulan durumu otomatik düzeltme** yeteneği. Temel mantık
+**istenen durum (desired state)** vs **gerçek durum** karşılaştırması: `replicas: 1` dediğinde
+Swarm'a "bundan hep 1 tane çalışsın" demiş olursun. Manager sürekli kontrol eder, ikisi
+uyuşmazsa farkı kapatır.
+
+```
+İstenen: 1 replica          İstenen: 1 replica
+Gerçek:  1 çalışıyor   ──►   Gerçek:  0 (çöktü!)
+                                  │  Swarm fark eder
+                                  ▼
+                            Otomatik yeni container başlatır → Gerçek: 1 ✓
+```
+
+- Container çökerse → Swarm yenisini başlatır.
+- Bir **node** komple çökerse → o makinenin container'larını başka sağlıklı node'lara taşır.
+- Biri yanlışlıkla container silerse → eksik kopyayı geri getirir.
+
+Faydası: dayanıklılık (resilience), az manuel müdahale, yüksek erişilebilirlik (replica >1 ise
+biri çökerken diğerleri trafiği karşılar, kullanıcı kesinti hissetmez).
+
+> ⚠️ **Sınır:** Self-healing "çalışması gerekirken durmuş olanı" geri getirir — **kötü kodu
+> düzeltmez**. Uygulama bug yüzünden sürekli çöküyorsa Swarm sürekli yeniden başlatır
+> (**crash loop**). Container'ın içindeki uygulama gerçekten sağlıklı mı diye bakmak için ayrı
+> bir **healthcheck** mekanizması var.
+
+### "Deploy edilmiş servisi nasıl güncellerim? Önce scale, sonra değiştir mi?"
+Sezgi doğru ama **scale ile update ayrı işlemler** — scale, update'in *parçası* değil, onu
+**kesintisiz** yapan ön koşul. Doğru akış:
+1. Yeni versiyonu **yeni tag**'le build + push (`1.0.0` → `1.0.1`). Swarm değişikliği tag'den anlar, aynı tag'i ezmek güvenilir değil.
+2. **Downtime olmaması için replica > 1 olmalı.** Tek replica varsa update'te o tek container durunca boşluk (downtime) olur → önce `docker service scale ...=3`.
+3. `docker service update --image ...:1.0.1 <servis>` → Swarm replica'ları **teker teker** değiştirir (**rolling update**); biri güncellenirken diğerleri trafiği karşılar.
+4. `update_config` ile davranış ayarlanır: `order: start-first` (önce yeniyi başlat) + `failure_action: rollback` (patlarsa otomatik geri dön).
+
+Zaten `replicas` 1'den fazlaysa ayrıca scale etmene gerek yok, doğrudan `service update` yeterli.
+Detay + diyagram: bkz. [Bölüm 3.6](#36-docker-swarm-ile-deployment-detay).
+
+### "Reverse proxy nedir, neden lazım? Broker'dan farkı ne?"
+**Problem:** Swarm'ı ayağa kaldırmak kolay ama front-end'e/broker'a düzgün erişim yok — her
+servis ayrı portta (`:8080`, `:8025`...). Kullanıcı `http://site.com:8080/handle` yazmaz.
+**Çözüm:** Tüm servislerin en önüne bir **reverse proxy (Caddy/Nginx/Traefik)** koyarsın; bütün
+istekler ona gelir, o **URL yoluna** bakıp doğru servise yönlendirir: `/` → front-end, `/handle`
+→ broker. Dışarı bakan **sadece bu iki servis** var; gerisi iç ağda kapalı.
+
+**Broker'la karıştırma — iki ayrı katman:** Reverse proxy *tüm Swarm'ın en önünde*, **URL yoluna**
+bakar (front-end mi broker mı). Broker (API Gateway) *mikroservislerin önünde*, istek
+body'sindeki **`action` alanına** bakar (auth/log/mail). Akış: `Tarayıcı → Proxy → Broker →
+auth/logger/mailer`. Detay: bkz. [Bölüm 3.6](#36-docker-swarm-ile-deployment-detay).
+
+### "Caddyfile'da `localhost:80` neden `:80` ile? Olmazsa ne olur?"
+Caddy varsayılan olarak her site bloğu için **otomatik HTTPS** dener → Let's Encrypt'ten SSL
+sertifikası ister. Ama `localhost`/`backend` gerçek domain değil, Let's Encrypt bunlara sertifika
+**veremez** → patlar. `:80` yazmak Caddy'ye **"düz HTTP yeter, HTTPS deneme"** der. Gerçek
+domain'de `:80`'i kaldırırsın, otomatik HTTPS devreye girer. Her `isim:port { }` bloğu bir
+**virtual host** (Caddy host adına göre yönlendirir: `localhost`→front-end, `backend`→broker).
+
+### "`backend`'i neden `/etc/hosts`'a ekledik?"
+`localhost` her makinede otomatik tanımlı ama `backend` **uydurma bir isim** — makine onu
+çözemez. `/etc/hosts`'a `127.0.0.1 localhost backend` ekleyince `backend` de kendi makineyi
+işaret eder, böylece tarayıcıdan `http://backend` Caddy'ye ulaşır. Sadece **bu makine** için
+geçerli lokal çözüm; gerçek sunucuda yerine gerçek domain + DNS olur.
+
+### "SSL/TLS sertifikası nedir?"
+Sitenin **dijital kimlik belgesi**. İki iş yapar: (1) **kimlik doğrulama** — "ben gerçekten o
+siteyim, sahte değil" (güvenilir bir **CA**/otorite imzalar), (2) **şifreleme** — içindeki public
+key ile veri şifrelenir, sadece sunucudaki private key çözer (yolda kimse okuyamaz). `https://`
+ve kilit ikonu bu demek. **CA** = sertifikayı imzalayan güvenilir kuruluş (pasaport veren devlet
+gibi); bizimki **Let's Encrypt** (ücretsiz, otomatik). **Caddy** bu sertifikayı otomatik alır,
+kurar ve yeniler — `caddy_data` volume'u da sertifikaları kalıcı saklar (yoksa rate limit'e
+takılırsın). Terim notu: doğrusu **TLS**, "SSL" eski adı, ikisi de aynı şey.
+
+### "Linode'dan server kiralama — bu artık mikroservise özel değil mi?"
+Doğru. Buradan sonrası **mikroservis mimarisi değil, deployment/DevOps**. Server kiralamak
+(Linode = bulut VPS sağlayıcısı, AWS/DigitalOcean gibi), Docker'a koyabildiğin **herhangi bir
+projeyi** yayına almanın bir yolu — mikroservis, monolith, tek script fark etmez, adımlar aynı.
+Bu yüzden bu bilgi **transfer edilebilir**: image yap → Docker Hub'a push → sunucu kirala →
+Swarm kur → deploy → proxy+SSL. Hocanın "2 server al" demesinin sebebi: multi-node Swarm'ı
+gerçekten görmek (Server 1 = manager/`swarm init`, Server 2 = worker/`swarm join`; bir node
+çökünce container'ların diğerine kaymasını izlemek). **Ücretli** olduğu için alternatif:
+Play with Docker (ücretsiz, tarayıcıda) ya da lokal VM'ler. Detay: bkz. [Bölüm 3.6](#36-docker-swarm-ile-deployment-detay).
+
 ---
 
 ## 7. Takıldığım Hatalar ve Çözümleri
@@ -508,6 +1206,8 @@ biri diğerini etkilemez (Polyglot Persistence).
 | `SyntaxError: Unexpected non-whitespace character after JSON` | Broker `/handle` endpoint'i hiç eklenmemişti → 404 HTML dönüyordu, JSON parse patlıyordu | `routes.go`'ya `mux.Post("/handle", app.HandleSubmission)` eklendi |
 | `listen tcp :80: bind: address already in use` (logger/front-end) | Local'de port 80 Docker tarafından tutuluyordu | Local test için farklı port (8082 logger, 8083 front-end) |
 | `"/templates": not found` (mail Dockerfile) | `templates/` klasörü hiç oluşturulmamıştı, mailer.go `./templates/...` arıyordu | Template dosyaları oluşturuldu (`mail.html.gohtml`, `mail.plain.gohtml`) |
+| `zsh: command not found: protoc` | `protoc`'u elle `go/bin`'e kopyalamıştım ama (1) o klasör PATH'te değildi (2) elle kopya eksikti (yanında `include/` `.proto` dosyaları yok) | `brew install protobuf` (PATH'teki `/opt/homebrew/bin`'e + standart `.proto`'larla kurar). Ayrı olarak `protoc-gen-go` + `protoc-gen-go-grpc` plugin'leri `go install` ile, `$GOPATH/bin` `~/.zshrc`'ye eklendi |
+| `swarm.yml` front-end servisi bozuk | `mode: replicated:` (sonda fazladan `:`) yazılmış, `replicas` yanlış girintiye kaymıştı | `mode: replicated` + altına aynı hizada `replicas: 1` (diğer servislerle tutarlı) |
 
 ---
 
@@ -556,11 +1256,14 @@ kopyalanıyor (Go'da kolay kod paylaşımı yok).
 Kursun gidişatına göre muhtemel sonraki adımlar:
 
 - [ ] Listener'da `auth` case'ini doldurup RabbitMQ üzerinden authentication
-- [ ] gRPC ile servis-servis iletişimi (logger zaten gRPC portu tanımlamış)
+- [x] gRPC ile servis-servis iletişimi — `logs.proto`, `protoc` kod üretimi, logger server (`grpc.go`, :50001), broker client (`LogViaGRPC`). Logger artık 3 protokol dinliyor. Bkz. [Bölüm 3.5](#35-grpc-ile-servis-iletişimi-detay).
 - [x] RPC (logger'daki `rpcPort = 5001`) — `rpc.go` + `rpcListen()` tamamlandı
+- [ ] gRPC'yi `make`/Docker'a entegre et + front-end test sayfasına "Test gRPC" butonu (henüz endpoint `/log-grpc` elle test ediliyor)
 - [ ] Servislerin daha fazla asenkron mesajlaşmaya geçmesi
 - [ ] Production güvenliği: mail servisini iç ağa kapatma, broker'ın doğrudan mail çağırmaması
-- [ ] Deployment / orchestration (Docker Swarm veya Kubernetes?)
+- [x] Deployment / orchestration — **Docker Swarm**: image'lar Docker Hub'a push'landı, `swarm.yml` ile `docker stack deploy`. Bkz. [Bölüm 3.6](#36-docker-swarm-ile-deployment-detay).
+- [ ] Swarm'da servisleri ölçekleme (`docker service scale`) + rolling update (yeni image versiyonuna sıfır kesintiyle geçiş)
+- [ ] (İleride) Kubernetes ile aynı sistemi deploy etme
 - [ ] Monitoring / tracing
 
 ---

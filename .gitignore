@@ -6,6 +6,8 @@
 authApp
 brokerApp
 frontApp
+frontEndApp
+front-end/web
 
 # Local Postgres data
 project/db-data/
