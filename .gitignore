@@ -11,3 +11,12 @@ front-end/web
 
 # Local Postgres data
 project/db-data/
+loggerApp
+mailerApp
+listenerApp
+logger-service/api
+
+# Editor / tool files
+.idea/
+.vscode/
+.claude/
